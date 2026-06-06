@@ -18,6 +18,27 @@ import os
 from typing import Any, Optional
 
 
+import time
+
+
+def _safe_replace(src: str, dst: str) -> None:
+    """Safely replace a file, with retries on Windows to handle locks."""
+    if os.name == "nt":
+        max_retries = 5
+        delay = 0.05
+        for i in range(max_retries):
+            try:
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if i == max_retries - 1:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+    else:
+        os.replace(src, dst)
+
+
 def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = None) -> None:
     """Atomically persist `data` as JSON at `path`.
 
@@ -30,7 +51,7 @@ def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = None) -> 
         json.dump(data, f, indent=indent)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _safe_replace(tmp, path)
 
 
 def atomic_write_text(path: str, text: str) -> None:
@@ -40,4 +61,4 @@ def atomic_write_text(path: str, text: str) -> None:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _safe_replace(tmp, path)

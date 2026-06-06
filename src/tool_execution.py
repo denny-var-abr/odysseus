@@ -168,7 +168,8 @@ def _is_sensitive_path(resolved: str) -> bool:
     """Return True if *resolved* falls under a sensitive directory or
     matches a sensitive filename — regardless of what root it sits under.
     """
-    parts = resolved.split(os.sep)
+    normalized = resolved.replace("/", os.sep)
+    parts = normalized.split(os.sep)
     filenames: set[str] = {parts[-1]} if parts else set()
 
     # Check if any path component is a sensitive directory.
@@ -204,8 +205,8 @@ def _tool_path_roots() -> list[str]:
     except OSError:
         pass
 
-    # $TMPDIR — per-user temp root on macOS (e.g. /var/folders/.../T/).
-    tmpdir = os.environ.get("TMPDIR")
+    # $TMPDIR / $TEMP / $TMP — per-user temp root
+    tmpdir = os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP")
     if tmpdir:
         roots.append(tmpdir)
 
@@ -282,26 +283,67 @@ def _resolve_tool_path_in_workspace(workspace: str, raw_path: str) -> str:
     if raw_path is None or not str(raw_path).strip():
         raise ValueError("path is required")
     base = os.path.realpath(workspace)
-    expanded = os.path.expanduser(str(raw_path).strip())
-    candidate = expanded if os.path.isabs(expanded) else os.path.join(base, expanded)
-    resolved = os.path.realpath(candidate)
-    if _is_sensitive_path(resolved):
+    raw_path = str(raw_path).strip()
+
+    # Clean cygwin/MSYS drive prefixes and slash-prefixed drive letters on Windows
+    if os.name == "nt":
+        # Convert /c/path to c:/path
+        if re.match(r"^/[a-zA-Z]/", raw_path):
+            raw_path = raw_path[1] + ":" + raw_path[2:]
+        # Convert /c: to c:
+        elif re.match(r"^/[a-zA-Z]:", raw_path):
+            raw_path = raw_path[1:]
+
+    # Clean workspace/ or /workspace/ prefixes
+    norm_raw = raw_path.replace("\\", "/")
+    if norm_raw.startswith("workspace/"):
+        raw_path = raw_path[len("workspace/"):]
+    elif norm_raw.startswith("/workspace/"):
+        raw_path = raw_path[len("/workspace/"):]
+
+    # Clean leading slashes/backslashes to force a relative resolve first
+    cleaned_rel = raw_path.lstrip("/\\")
+    candidate_rel = os.path.join(base, cleaned_rel)
+    resolved_rel = os.path.realpath(candidate_rel)
+
+    # If it is inside the workspace and is not sensitive, use it
+    if resolved_rel != base:
+        nbase = os.path.normcase(base)
+        try:
+            if os.path.commonpath([os.path.normcase(resolved_rel), nbase]) == nbase:
+                if _is_sensitive_path(resolved_rel):
+                    raise ValueError(
+                        f"path '{raw_path}' is inside a sensitive directory "
+                        f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
+                    )
+                return resolved_rel
+        except ValueError:
+            pass
+    else:
+        if _is_sensitive_path(resolved_rel):
+            raise ValueError(
+                f"path '{raw_path}' is inside a sensitive directory "
+                f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
+            )
+        return resolved_rel
+
+    # Fall back to resolving as a standard absolute path
+    expanded = os.path.expanduser(raw_path)
+    candidate_abs = expanded if os.path.isabs(expanded) else os.path.join(base, expanded)
+    resolved_abs = os.path.realpath(candidate_abs)
+    if _is_sensitive_path(resolved_abs):
         raise ValueError(
             f"path '{raw_path}' is inside a sensitive directory "
             f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
         )
-    if resolved != base:
-        # normcase so containment holds on case-insensitive filesystems
-        # (Windows, default macOS): it lowercases on Windows and is a no-op on
-        # POSIX. commonpath raises ValueError across Windows drives (C: vs D:)
-        # or mixed abs/rel — both mean "outside", so the except rejects them.
+    if resolved_abs != base:
         nbase = os.path.normcase(base)
         try:
-            if os.path.commonpath([os.path.normcase(resolved), nbase]) != nbase:
+            if os.path.commonpath([os.path.normcase(resolved_abs), nbase]) != nbase:
                 raise ValueError
         except ValueError:
             raise ValueError(f"path '{raw_path}' is outside the workspace ({workspace})")
-    return resolved
+    return resolved_abs
 
 # Bash + python tools used to share a single 60s timeout. That's
 # enough for one-shot commands but starves real workloads (pip
@@ -675,13 +717,24 @@ async def _direct_fallback(
 
     try:
         if tool == "bash":
-            proc = await asyncio.create_subprocess_shell(
-                content,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_subproc_env,
-                cwd=workspace or _AGENT_WORKDIR,
-            )
+            from core.platform_compat import find_bash, IS_WINDOWS
+            bash_bin = find_bash() if IS_WINDOWS else None
+            if bash_bin:
+                proc = await asyncio.create_subprocess_exec(
+                    bash_bin, "-c", content,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_subproc_env,
+                    cwd=workspace or _AGENT_WORKDIR,
+                )
+            else:
+                proc = await asyncio.create_subprocess_shell(
+                    content,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_subproc_env,
+                    cwd=workspace or _AGENT_WORKDIR,
+                )
             stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
                 proc,
                 timeout=DEFAULT_BASH_TIMEOUT,

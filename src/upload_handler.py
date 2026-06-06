@@ -312,7 +312,20 @@ class UploadHandler:
                     shutil.copy2(path, bak)
                 except OSError:
                     pass
-            os.replace(tmp, path)
+            if os.name == "nt":
+                max_retries = 5
+                delay = 0.05
+                for i in range(max_retries):
+                    try:
+                        os.replace(tmp, path)
+                        break
+                    except PermissionError:
+                        if i == max_retries - 1:
+                            raise
+                        time.sleep(delay)
+                        delay *= 2
+            else:
+                os.replace(tmp, path)
         except Exception:
             try:
                 os.unlink(tmp)

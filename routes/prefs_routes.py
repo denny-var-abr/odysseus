@@ -19,13 +19,8 @@ def _load():
 
 
 def _save(prefs):
-    os.makedirs(os.path.dirname(PREFS_FILE) or ".", exist_ok=True)
-    tmp = f"{PREFS_FILE}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(prefs, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, PREFS_FILE)
+    from core.atomic_io import atomic_write_json
+    atomic_write_json(PREFS_FILE, prefs, indent=2)
 
 
 def _load_for_user(user: Optional[str] = None) -> dict:
